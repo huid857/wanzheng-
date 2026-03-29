@@ -26,6 +26,16 @@ from similar_shoe_predictor import SimilarShoePredictor
 
 class EnsemblePredictor:
     """集成预测器"""
+
+    # 默认启用模型（去同质化版本）：
+    # - 保留历史统计/路型/门控核心
+    # - 默认使用 V2 机器学习模型
+    # - V1（LSTM/RandomForest）仅在 V2 不可用时作为兜底，不默认并行投票
+    DEFAULT_ENABLED_MODELS = {
+        'Historical', 'Trend', 'Streak', 'Frequency',
+        'LSTM_V2', 'RF_V2', 'LSTM', 'RandomForest',
+        'SimilarShoe', 'DoubleAlt', 'DerivedRoad', 'ThreeBead'
+    }
     
     def __init__(self, all_data, current_shoe_data, shoes=None, prediction_history=None, enabled_models=None):
         """
@@ -43,7 +53,8 @@ class EnsemblePredictor:
         self.current_shoe_data = current_shoe_data
         self.combined_data = all_data + current_shoe_data
         self.shoes = shoes if shoes else []
-        self.enabled_models = enabled_models  # None = 全部启用
+        self.enabled_models = enabled_models if enabled_models is not None else set(self.DEFAULT_ENABLED_MODELS)
+        self._last_current_shoe_len = len(current_shoe_data) if current_shoe_data is not None else 0
         
         # 初始化分析器（传入当前靴牌数据，避免Streak跨靴牌）
         self.analyzer = BaccaratAnalyzer(self.combined_data, self.current_shoe_data)
@@ -108,9 +119,12 @@ class EnsemblePredictor:
         Audit#A 修复：同步 IntraShoeNgram（原来没有同步，
         导致每局结束后的靴内N-gram一直用旧数据）
         """
+        old_len = getattr(self, '_last_current_shoe_len', len(self.current_shoe_data) if hasattr(self, 'current_shoe_data') else 0)
+
         self.all_data = all_data
         self.current_shoe_data = current_shoe_data
         self.combined_data = all_data + current_shoe_data
+        self._last_current_shoe_len = len(current_shoe_data)
 
         # 同步 Analyzer 层
         if hasattr(self, 'analyzer') and self.analyzer:
@@ -129,6 +143,18 @@ class EnsemblePredictor:
             # Audit#A修复：重建 IntraShoeNgram，使其持有最新靴内数据
             if hasattr(self.historical, 'intra_ngram'):
                 self.historical.intra_ngram = IntraShoeNgramPredictor(current_shoe_data)
+
+        # 同步基础统计/ML层（修复：避免 can_train 与底层数据脱节）
+        if hasattr(self, 'freq') and self.freq:
+            self.freq.data = self.combined_data
+        if hasattr(self, 'lstm') and self.lstm:
+            self.lstm.data = [x for x in self.combined_data if x != 'T']
+        if hasattr(self, 'rf') and self.rf:
+            self.rf.data = [x for x in self.combined_data if x != 'T']
+
+        # 新靴检测：当前靴长度回退，重置 Regime 轨迹，避免跨靴污染
+        if len(current_shoe_data) < old_len and hasattr(self, 'regime_detector') and self.regime_detector:
+            self.regime_detector.reset()
 
     def predict_next(self):
         """
@@ -174,6 +200,10 @@ class EnsemblePredictor:
                 base_weight = 0.8
                 adjusted_weight = self._adjust_model_weight(model_name, base_weight, weight_adjustment, shoe_weight_adj)
                 adjusted_weight = self._apply_regime_weight(model_name, adjusted_weight, regime_weight_adj)
+                # 修复：Regime 的 IntraShoeNgram 调整项此前无法命中顶层模型名。
+                # 这里作为 Historical 子模型代理进行映射。
+                if regime_weight_adj and 'IntraShoeNgram' in regime_weight_adj:
+                    adjusted_weight *= regime_weight_adj['IntraShoeNgram']
                 predictions.append({
                     'name': model_name,
                     'weight': adjusted_weight,
@@ -224,8 +254,9 @@ class EnsemblePredictor:
                 })
                 self.last_model_predictions[model_name] = self._get_prediction_choice(freq_pred)
 
-        # 5. LSTM预测
-        if self._model_enabled('LSTM') and self.lstm.can_train():
+        # 5. LSTM预测（V1兜底，仅在 V2 不可用时启用）
+        v2_lstm_available = self.lstm_v2 and self.lstm_v2.can_train()
+        if (not v2_lstm_available) and self._model_enabled('LSTM') and self.lstm.can_train():
             try:
                 lstm_pred = self.lstm.predict(self.current_shoe_data)
                 if lstm_pred['confidence'] > 0:
@@ -238,8 +269,9 @@ class EnsemblePredictor:
             except BaseException:
                 pass
 
-        # 6. 随机森林预测
-        if self._model_enabled('RandomForest') and self.rf.can_train():
+        # 6. 随机森林预测（V1兜底，仅在 RF_V2 不可用时启用）
+        v2_rf_available = self.rf_v2 and self.rf_v2.can_train()
+        if (not v2_rf_available) and self._model_enabled('RandomForest') and self.rf.can_train():
             try:
                 rf_pred = self.rf.predict(self.current_shoe_data)
                 if rf_pred['confidence'] > 0:

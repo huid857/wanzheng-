@@ -210,7 +210,9 @@ class HistoricalEnsemble:
 
         # 4. DataDriven
         if self.data_driven and self.data_driven.can_predict():
-            dd_pred = self.data_driven.predict(self.combined_data)
+            # 修复：DataDriven 的“当前模式”识别必须只基于当前靴牌，
+            # 不能传入 combined_data（会跨靴产生伪模式边界）。
+            dd_pred = self.data_driven.predict(self.current_shoe_data)
             if dd_pred['confidence'] > 0:
                 predictions.append({
                     'name': 'DataDriven',
